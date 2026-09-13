@@ -62,6 +62,7 @@ use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+use windows_sys::Win32::Foundation::WAIT_FAILED;
 use windows_sys::Win32::Storage::FileSystem::CreateFileW;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE;
@@ -80,6 +81,22 @@ use windows_sys::Win32::System::Threading::WaitForSingleObject;
 const READ_ACL_MUTEX_NAME: &str = "Local\\CodexSandboxReadAcl";
 const TERMINATION_WAIT_MS: u32 = 5_000;
 const WAIT_TIMEOUT: u32 = 0x0000_0102;
+
+fn win32_timeout_ms(timeout_ms: Option<u64>) -> u32 {
+    timeout_ms
+        .map(|ms| ms.min(u32::MAX as u64 - 1) as u32)
+        .unwrap_or(INFINITE)
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::win32_timeout_ms;
+
+    #[test]
+    fn clamps_large_timeout_without_encoding_infinite() {
+        assert_eq!(win32_timeout_ms(Some(u64::MAX)), u32::MAX - 1);
+    }
+}
 
 struct IpcSpawnedProcess {
     log_dir: PathBuf,
@@ -653,13 +670,28 @@ pub fn main() -> Result<()> {
         log_dir_owned,
     );
 
-    let timeout = req.timeout_ms.map(|ms| ms as u32).unwrap_or(INFINITE);
+    let timeout = win32_timeout_ms(req.timeout_ms);
     let wait_res = unsafe { WaitForSingleObject(pi.hProcess, timeout) };
     let timed_out = wait_res == WAIT_TIMEOUT;
-    let child_stopped = if timed_out {
+    let wait_failed = wait_res == WAIT_FAILED;
+    let wait_error = if wait_failed {
+        Some(unsafe { GetLastError() })
+    } else {
+        None
+    };
+    let child_stopped = if wait_failed || timed_out {
         terminate_job_or_process(&job, pi.hProcess, log_dir);
         let termination_wait = unsafe { WaitForSingleObject(pi.hProcess, TERMINATION_WAIT_MS) };
-        if termination_wait == WAIT_TIMEOUT {
+        if termination_wait == WAIT_FAILED {
+            log_note(
+                &format!(
+                    "runner failed waiting for process termination: {}",
+                    unsafe { GetLastError() }
+                ),
+                log_dir,
+            );
+            false
+        } else if termination_wait == WAIT_TIMEOUT {
             log_note(
                 "runner root process did not exit after termination",
                 log_dir,
@@ -680,7 +712,15 @@ pub fn main() -> Result<()> {
 
     let exit_code: i32;
     unsafe {
-        if timed_out {
+        if wait_failed {
+            exit_code = 1;
+            let _ = send_error(
+                &pipe_write,
+                ErrorStage::WaitForProcess,
+                wait_error,
+                "runner failed waiting for child process".to_string(),
+            );
+        } else if timed_out {
             exit_code = 128 + 64;
         } else {
             let mut raw_exit: u32 = 1;

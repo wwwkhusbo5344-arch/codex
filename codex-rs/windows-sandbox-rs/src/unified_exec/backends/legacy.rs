@@ -1,4 +1,5 @@
 use super::windows_common::finish_driver_spawn;
+use super::windows_common::win32_timeout_ms;
 use crate::conpty::ConptyInstance;
 use crate::conpty::spawn_conpty_process_as_user;
 use crate::desktop::LaunchDesktop;
@@ -39,6 +40,7 @@ use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+use windows_sys::Win32::Foundation::WAIT_FAILED;
 use windows_sys::Win32::Storage::FileSystem::WriteFile;
 use windows_sys::Win32::System::Console::COORD;
 use windows_sys::Win32::System::Console::ResizePseudoConsole;
@@ -261,8 +263,18 @@ fn finalize_exit(
             && let Some(handle) = guard.as_ref()
         {
             unsafe {
-                WaitForSingleObject(*handle, INFINITE);
-                GetExitCodeProcess(*handle, &mut raw_exit);
+                let wait_result = WaitForSingleObject(*handle, INFINITE);
+                if wait_result == WAIT_FAILED {
+                    log_note(
+                        &format!(
+                            "legacy spawn failed waiting for process: {}",
+                            GetLastError()
+                        ),
+                        logs_base_dir,
+                    );
+                } else {
+                    GetExitCodeProcess(*handle, &mut raw_exit);
+                }
             }
         }
         raw_exit as i32
@@ -345,6 +357,11 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
     )?;
     if !common.permissions.has_full_disk_read_access() {
         anyhow::bail!("Restricted read-only access requires the elevated Windows sandbox backend");
+    }
+    if common.permissions.network_policy()
+        == codex_protocol::permissions::NetworkSandboxPolicy::Restricted
+    {
+        anyhow::bail!("restricted network access requires the elevated Windows sandbox backend");
     }
     // WRITE_RESTRICTED tokens consult restricting SIDs only for writes, so this
     // backend cannot make capability-SID deny-read ACLs authoritative.
@@ -435,9 +452,18 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
     let wait_logs_base_dir = common.logs_base_dir.clone();
     std::thread::spawn(move || {
         let _desktop = desktop;
-        let timeout = timeout_ms.map(|ms| ms as u32).unwrap_or(INFINITE);
+        let timeout = win32_timeout_ms(timeout_ms);
         let wait_res = unsafe { WaitForSingleObject(pi.hProcess, timeout) };
-        if wait_res == WAIT_TIMEOUT {
+        if wait_res == WAIT_FAILED {
+            log_note(
+                &format!(
+                    "legacy spawn failed waiting for process: {}",
+                    unsafe { GetLastError() }
+                ),
+                wait_logs_base_dir.as_deref(),
+            );
+            terminate_job_or_process(&job_for_wait, &wait_handle, wait_logs_base_dir.as_deref());
+        } else if wait_res == WAIT_TIMEOUT {
             terminate_job_or_process(&job_for_wait, &wait_handle, wait_logs_base_dir.as_deref());
         } else if let Err(err) = job_for_wait.preserve_descendants() {
             log_note(

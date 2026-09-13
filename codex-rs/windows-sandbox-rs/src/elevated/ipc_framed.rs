@@ -128,6 +128,7 @@ pub enum ErrorStage {
     ReadSpawnRequest,
     SpawnChild,
     WriteSpawnReady,
+    WaitForProcess,
 }
 
 /// Empty payload for control messages.

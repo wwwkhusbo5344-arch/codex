@@ -17,6 +17,23 @@ use std::fs::File;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use windows_sys::Win32::System::Threading::INFINITE;
+
+pub(crate) fn win32_timeout_ms(timeout_ms: Option<u64>) -> u32 {
+    timeout_ms
+        .map(|ms| ms.min(u32::MAX as u64 - 1) as u32)
+        .unwrap_or(INFINITE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::win32_timeout_ms;
+
+    #[test]
+    fn clamps_large_timeout_without_encoding_infinite() {
+        assert_eq!(win32_timeout_ms(Some(u64::MAX)), u32::MAX - 1);
+    }
+}
 
 pub(crate) fn finish_driver_spawn(driver: ProcessDriver, stdin_open: bool) -> SpawnedProcess {
     let spawned = spawn_from_driver(driver);

@@ -469,6 +469,8 @@ mod windows_impl {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Foundation::WAIT_FAILED;
+    use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
     use windows_sys::Win32::Foundation::HANDLE_FLAG_INHERIT;
     use windows_sys::Win32::Foundation::SetHandleInformation;
     use windows_sys::Win32::System::Pipes::CreatePipe;
@@ -482,6 +484,7 @@ mod windows_impl {
         Exited,
         TimedOut,
         Cancelled,
+        Failed(io::Error),
     }
 
     fn wait_for_process(
@@ -490,10 +493,14 @@ mod windows_impl {
         cancellation: Option<&WindowsSandboxCancellationToken>,
     ) -> WaitOutcome {
         let Some(cancellation) = cancellation else {
-            let timeout = timeout_ms.map(|ms| ms as u32).unwrap_or(INFINITE);
+            let timeout = timeout_ms
+                .map(|ms| ms.min(u32::MAX as u64 - 1) as u32)
+                .unwrap_or(INFINITE);
             let res = unsafe { WaitForSingleObject(process, timeout) };
-            return if res == 0x0000_0102 {
+            return if res == WAIT_TIMEOUT {
                 WaitOutcome::TimedOut
+            } else if res == WAIT_FAILED {
+                WaitOutcome::Failed(io::Error::last_os_error())
             } else {
                 WaitOutcome::Exited
             };
@@ -515,10 +522,14 @@ mod windows_impl {
                 None => 50,
             };
             let res = unsafe { WaitForSingleObject(process, wait_ms) };
-            if res == 0x0000_0102 {
+            if res == WAIT_TIMEOUT {
                 continue;
             }
-            return WaitOutcome::Exited;
+            return if res == WAIT_FAILED {
+                WaitOutcome::Failed(io::Error::last_os_error())
+            } else {
+                WaitOutcome::Exited
+            };
         }
     }
 
@@ -626,6 +637,11 @@ mod windows_impl {
             anyhow::bail!(
                 "Restricted read-only access requires the elevated Windows sandbox backend"
             );
+        }
+        if permissions.network_policy()
+            == codex_protocol::permissions::NetworkSandboxPolicy::Restricted
+        {
+            anyhow::bail!("restricted network access requires the elevated Windows sandbox backend");
         }
         // WRITE_RESTRICTED tokens consult restricting SIDs only for writes, so this
         // backend cannot make capability-SID deny-read ACLs authoritative.
@@ -750,15 +766,19 @@ mod windows_impl {
         });
 
         let wait_outcome = wait_for_process(pi.hProcess, timeout_ms, cancellation.as_ref());
-        let timed_out = matches!(wait_outcome, WaitOutcome::TimedOut);
-        let cancelled = matches!(wait_outcome, WaitOutcome::Cancelled);
+        let (timed_out, cancelled, wait_error) = match wait_outcome {
+            WaitOutcome::TimedOut => (true, false, None),
+            WaitOutcome::Cancelled => (false, true, None),
+            WaitOutcome::Failed(err) => (false, false, Some(err)),
+            WaitOutcome::Exited => (false, false, None),
+        };
         let mut exit_code_u32: u32 = 1;
-        if !timed_out && !cancelled {
+        if !timed_out && !cancelled && wait_error.is_none() {
             unsafe {
                 GetExitCodeProcess(pi.hProcess, &mut exit_code_u32);
             }
         }
-        if timed_out || cancelled {
+        if timed_out || cancelled || wait_error.is_some() {
             if let Err(job_err) = job.terminate() {
                 log_note(
                     &format!("capture failed to terminate process tree: {job_err}"),
@@ -808,6 +828,9 @@ mod windows_impl {
             log_failure(&command, &format!("exit code {exit_code}"), logs_base_dir);
         }
 
+        if let Some(err) = wait_error {
+            return Err(err.into());
+        }
         Ok(CaptureResult {
             exit_code,
             stdout,
