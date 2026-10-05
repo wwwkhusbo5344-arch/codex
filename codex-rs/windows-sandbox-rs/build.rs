@@ -18,15 +18,15 @@ fn main() -> Result<(), String> {
 
     // Keep this scoped to the setup helper so Codex binaries that link the
     // library do not inherit any resource metadata from this package.
-    match (
-        env::var("CARGO_CFG_TARGET_ENV").as_deref(),
-        env::var("CARGO_CFG_TARGET_ABI").as_deref(),
-    ) {
-        (Ok("msvc"), _) => {
+    match env::var("CARGO_CFG_TARGET_ENV").as_deref() {
+        Ok("msvc") => {
             println!("cargo:rustc-link-arg-bin={SETUP_BIN}=/MANIFEST:EMBED");
             println!("cargo:rustc-link-arg-bin={SETUP_BIN}=/MANIFESTINPUT:{manifest_path}");
         }
-        (Ok("gnu"), Ok("llvm")) => {
+        Ok("gnu") => {
+            // Windows GNU targets (including gnullvm / clang-based cross-builds)
+            // do not set a target ABI value like MSVC does, but still need the
+            // same asInvoker manifest embedded.
             println!("cargo:rustc-link-arg-bin={SETUP_BIN}=-Wl,-Xlink=/manifest:embed");
             println!(
                 "cargo:rustc-link-arg-bin={SETUP_BIN}=-Wl,-Xlink=/manifestinput:{manifest_path}"
